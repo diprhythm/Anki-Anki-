@@ -2,149 +2,237 @@
 # -*- coding: utf-8 -*-
 
 """
-批量抓取有道词典释义 -> 导出 Excel（两列：word, definition）
-改进点：
-  - 运行时输入 words.txt 路径（自动清理不可见字符）
-  - 批次内查重（大小写无关）并跳过重复单词
-  - 输出 youdao_defs.xlsx 到 words.txt 的同一路径
-  - 多条释义用换行 \n 连接（Excel 单元格多行；Anki 导入勾选“Keep line breaks”即可换行显示）
-依赖：pip install requests beautifulsoup4 lxml pandas openpyxl
+把 youdao_defs.xlsx（两列：word, definition）追加导入到现有 Anki 牌组
+新增：导入前总览（N/A/R）+ 交互确认
+依赖：pip install pandas openpyxl requests
+确保：Anki 已运行，安装 AnkiConnect（http://localhost:8765）
 """
 
-import time
-import random
-import pathlib
-import logging
-from typing import List, Tuple
-
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
+from typing import List, Dict, Any
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-BASE_URL = "https://dict.youdao.com/w/eng/{word}/"
-
-SLEEP_RANGE = (0.8, 1.6)  # 请求间隔
-TIMEOUT = 12
-RETRY = 2
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+ANKI_URL = "http://localhost:8765"
+MODEL_NAME = "Youdao Basic (Auto)"     # 若不存在会自动创建
+TAGS = ["youdao", "auto"]
+BATCH_SIZE = 100                        # 分批提交大小（长名单更稳）
 
 
-def clean_invisibles(s: str) -> str:
-    # 清理常见不可见字符：U+202A/U+202B（方向嵌入）、BOM 等
-    return s.replace("\u202a", "").replace("\u202b", "").replace("\ufeff", "")
+# ---------- 基础 RPC ----------
+def _post(payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(ANKI_URL, json=payload)
+    r.raise_for_status()
+    return r.json()
+
+def invoke(action: str, **params):
+    payload = {"action": action, "version": 6, "params": params}
+    resp = _post(payload)
+    # 某些版本会把重复等信息塞进 error；此处宽容返回
+    if resp.get("error"):
+        return {"error": resp["error"], "result": resp.get("result")}
+    return resp.get("result")
 
 
-def load_words(path: pathlib.Path) -> List[str]:
-    if not path.exists():
-        raise FileNotFoundError(f"未找到 {path}，请检查路径是否正确")
-    words: List[str] = []
-    seen_ci = set()  # case-insensitive 去重
-    for line in path.read_text(encoding="utf-8").splitlines():
-        w = clean_invisibles(line).strip()
-        if not w or w.startswith("#"):
-            continue
-        key = w.lower()
-        if key in seen_ci:
-            continue  # 批次内重复 => 跳过
-        seen_ci.add(key)
-        words.append(w)
-    return words
+# ---------- 准备环境 ----------
+def ensure_deck(deck_name: str):
+    decks = invoke("deckNames")
+    if isinstance(decks, dict):  # 兼容 error 透传
+        raise RuntimeError(f"AnkiConnect error (deckNames): {decks}")
+    if deck_name not in decks:
+        res = invoke("createDeck", deck=deck_name)
+        if isinstance(res, dict) and res.get("error"):
+            raise RuntimeError(f"AnkiConnect error (createDeck): {res}")
+
+def ensure_model(model_name: str):
+    models = invoke("modelNames")
+    if isinstance(models, dict):
+        raise RuntimeError(f"AnkiConnect error (modelNames): {models}")
+    if model_name in models:
+        return
+    templates = [{
+        "Name": "Card 1",
+        "Front": "{{Front}}",
+        "Back": "{{Front}}<hr id=answer>{{Back}}"
+    }]
+    css = """
+.card { font-family: -apple-system, Segoe UI, Roboto, Noto Sans SC, Arial; font-size: 20px; line-height: 1.5; }
+hr { margin: 12px 0; }
+"""
+    fields = [{"name": "Front"}, {"name": "Back"}]
+    res = invoke(
+        "createModel",
+        modelName=model_name,
+        inOrderFields=[f["name"] for f in fields],
+        css=css,
+        isCloze=False,
+        cardTemplates=[{"Name": t["Name"], "Front": t["Front"], "Back": t["Back"]} for t in templates],
+    )
+    if isinstance(res, dict) and res.get("error"):
+        raise RuntimeError(f"AnkiConnect error (createModel): {res}")
 
 
-def fetch_html(url: str) -> str:
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
-    for attempt in range(RETRY + 1):
-        try:
-            resp = requests.get(url, headers=headers, timeout=TIMEOUT)
-            if resp.status_code == 200:
-                return resp.text
-            logging.warning(f"HTTP {resp.status_code} for {url}")
-        except requests.RequestException as e:
-            logging.warning(f"请求失败 {e} (尝试 {attempt+1}/{RETRY+1})")
-        time.sleep(0.7 + 0.5 * attempt)
-    return ""
-
-
-def parse_definitions(html: str) -> List[str]:
-    """
-    优先抓“基本释义”块；若缺失，兜底抓其他区域的简短文本。
-    返回多条释义的列表（不含分隔符）。
-    """
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "lxml")
-
-    defs = []
-    phrs = soup.select_one("#phrsListTab")
-    if phrs:
-        for li in phrs.select("div.trans-container ul li"):
-            text = " ".join(li.get_text(" ", strip=True).split())
-            if text:
-                defs.append(text)
-
-    if not defs:
-        for blk in soup.select("div.trans-container ul li"):
-            text = " ".join(blk.get_text(" ", strip=True).split())
-            if text:
-                defs.append(text)
-
-    if not defs:
-        collins_items = soup.select("div#collinsResult div.collinsMajorTrans p")
-        for p in collins_items[:3]:
-            text = " ".join(p.get_text(" ", strip=True).split())
-            if text:
-                defs.append(text)
-
-    # 去重 & 截断
-    seen, uniq = set(), []
-    for d in defs:
-        if d not in seen:
-            seen.add(d)
-            uniq.append(d)
-    return uniq[:5]  # 最多取前 5 条
-
-
-def get_youdao_definition(word: str) -> str:
-    url = BASE_URL.format(word=word)
-    html = fetch_html(url)
-    defs = parse_definitions(html)
-    if not defs:
+# ---------- 工具 ----------
+def newline_to_html(s: str) -> str:
+    if s is None:
         return ""
-    # 用换行连接，而不是用 |
-    return "\n".join(defs)
+    return str(s).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
+# ---------- 主流程 ----------
 def main():
-    # 读取并清理输入路径
-    raw = input("请输入 words.txt 文件路径: ").strip().strip('"').strip("'")
-    raw = clean_invisibles(raw)
-    words_path = pathlib.Path(raw)
-    print(f"实际使用路径: {words_path}")
+    xlsx_path = input("请输入 youdao_defs.xlsx 文件路径: ").strip().strip('"').strip("'")
+    deck_name = input("请输入要追加导入的 Anki 牌组名称: ").strip()
 
-    words = load_words(words_path)
+    # 读 Excel（兼容大小写/不规范列名）
+    df = pd.read_excel(xlsx_path, dtype=str).fillna("")
+    lower_cols = {c.lower(): c for c in df.columns}
+    if "word" not in lower_cols or "definition" not in lower_cols:
+        raise RuntimeError("Excel 需要包含列名：word, definition")
+    df = df.rename(columns={lower_cols["word"]: "word", lower_cols["definition"]: "definition"})
 
-    # 输出文件放在 words.txt 同目录
-    output_xlsx = words_path.parent / "youdao_defs.xlsx"
+    ensure_deck(deck_name)
+    ensure_model(MODEL_NAME)
 
-    rows: List[Tuple[str, str]] = []
-    for i, w in enumerate(words, 1):
-        time.sleep(random.uniform(*SLEEP_RANGE))
-        definition = get_youdao_definition(w)
-        # 如果本词抓到的释义里自己含有竖线，顺手替换为换行，保持干净
-        definition = definition.replace(" | ", "\n").replace("|", "\n")
-        rows.append((w, definition))
-        preview = definition.replace("\n", " \\n ")
-        logging.info(f"[{i}/{len(words)}] {w} -> {preview[:100]}{'...' if len(preview)>100 else ''}")
+    # 构造 notes（此处不直接 addNotes，先 canAddNotes 预检）
+    words: List[str] = []
+    notes: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        word = (row.get("word") or "").strip()
+        definition = (row.get("definition") or "").strip()
+        if not word:
+            continue
+        back_html = newline_to_html(definition)
+        note = {
+            "deckName": deck_name,
+            "modelName": MODEL_NAME,
+            "fields": {"Front": word, "Back": back_html},
+            "tags": TAGS,
+            "options": {
+                "allowDuplicate": False,
+                "duplicateScope": "deck"
+            }
+        }
+        words.append(word)
+        notes.append(note)
 
-    df = pd.DataFrame(rows, columns=["word", "definition"])
-    # 保留换行：Excel里同一个单元格会显示为多行（Alt+Enter）
-    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+    if not notes:
+        print("没有可导入的记录。")
+        return
 
-    logging.info(f"已生成 {output_xlsx}（两列：word, definition，释义为多行）")
-    print("\n导入 Anki 提示：\n- 使用“文件→导入”，选择该 Excel 转成的 TSV/CSV 或直接用 CSV 导出\n- 导入向导里勾选 ‘保留换行(Keep line breaks)’，即可在卡片上按行显示\n- 字段映射：Front=word, Back=definition\n")
+    # ===== 预检：canAddNotes =====
+    print("\n正在预检可添加性（canAddNotes）…")
+    can = invoke("canAddNotes", notes=notes)
+    # 若 can 返回异常，退化为全部尝试添加；但仍给出警告
+    if isinstance(can, dict) and can.get("error"):
+        print(f"[警告] canAddNotes 返回异常，将在导入阶段再判断重复：{can['error']}")
+        addable_mask = [True] * len(notes)
+    else:
+        addable_mask = list(can)
+
+    total = len(notes)
+    addable = sum(1 for x in addable_mask if x)
+    not_addable = total - addable
+
+    # 列出前 20 个预计重复/不可加的单词做预览
+    preview_dups = [w for w, ok in zip(words, addable_mask) if not ok][:20]
+
+    print("\n====== 导入前总览 ======")
+    print(f"总记录：{total}")
+    print(f"可新增：{addable}")
+    print(f"预计重复/不可添加：{not_addable}")
+    if preview_dups:
+        print("预计重复（前 20 个预览）:")
+        for w in preview_dups:
+            print(f"  - {w}")
+    print("========================")
+
+    # 交互确认
+    go = input(f"\n是否继续导入可新增的 {addable} 条？[y/N]: ").strip().lower()
+    if go not in ("y", "yes"):
+        print("已取消导入。")
+        return
+
+    # ===== 导入阶段 =====
+    added_total = 0
+    skipped_total = 0
+    failed_total = 0
+
+    if isinstance(can, dict) and can.get("error"):
+        # 退化路径：不能用 canAddNotes，只能直接提交并根据返回判断
+        print("\n[提示] 进入退化导入路径（无法使用 canAddNotes 结果）…")
+        for batch in chunked(list(zip(words, notes)), BATCH_SIZE):
+            batch_words = [w for w, _ in batch]
+            batch_notes = [n for _, n in batch]
+            add_res = invoke("addNotes", notes=batch_notes)
+
+            if isinstance(add_res, dict) and add_res.get("error"):
+                errs = add_res["error"]
+                if isinstance(errs, list):
+                    for w, msg in zip(batch_words, errs):
+                        if "duplicate" in str(msg).lower():
+                            print(f"[重复跳过] {w}")
+                            skipped_total += 1
+                        else:
+                            print(f"[失败] {w} -> {msg}")
+                            failed_total += 1
+                else:
+                    print(f"[失败] 整批失败 -> {errs}")
+                    failed_total += len(batch_words)
+            else:
+                for w, rid in zip(batch_words, add_res):
+                    if isinstance(rid, int):
+                        print(f"[导入成功] {w} -> noteId={rid}")
+                        added_total += 1
+                    elif rid is None:
+                        print(f"[重复跳过] {w}")
+                        skipped_total += 1
+                    else:
+                        print(f"[失败] {w} -> {rid}")
+                        failed_total += 1
+    else:
+        # 正常路径：只导入 addable 的条目
+        pairs_add = [(w, n) for (w, n), ok in zip(zip(words, notes), addable_mask) if ok]
+        pairs_skip = [(w, n) for (w, n), ok in zip(zip(words, notes), addable_mask) if not ok]
+
+        # 显式打印预计跳过的（重复/不可添加）
+        for w, _ in pairs_skip:
+            print(f"[重复跳过] {w}")
+
+        for batch in chunked(pairs_add, BATCH_SIZE):
+            batch_words = [w for w, _ in batch]
+            batch_notes = [n for _, n in batch]
+            add_res = invoke("addNotes", notes=batch_notes)
+
+            if isinstance(add_res, dict) and add_res.get("error"):
+                errs = add_res["error"]
+                if isinstance(errs, list):
+                    for w, msg in zip(batch_words, errs):
+                        if "duplicate" in str(msg).lower():
+                            print(f"[重复跳过] {w}")
+                            skipped_total += 1
+                        else:
+                            print(f"[失败] {w} -> {msg}")
+                            failed_total += 1
+                else:
+                    print(f"[失败] 整批失败 -> {errs}")
+                    failed_total += len(batch_words)
+            else:
+                for w, rid in zip(batch_words, add_res):
+                    if isinstance(rid, int):
+                        print(f"[导入成功] {w} -> noteId={rid}")
+                        added_total += 1
+                    elif rid is None:
+                        print(f"[重复跳过] {w}")
+                        skipped_total += 1
+                    else:
+                        print(f"[失败] {w} -> {rid}")
+                        failed_total += 1
+
+    print(f"\n完成：新增 {added_total} 条，跳过/重复 {skipped_total} 条，失败 {failed_total} 条，总计 {total} 条。")
 
 
 if __name__ == "__main__":
